@@ -1,0 +1,168 @@
+import requests
+from twilio.rest import Client as TwilioClient
+import telebot
+import time
+import logging
+import pandas as pd
+from binance.client import Client
+from binance.enums import *
+from typing import Tuple, Optional, Dict
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('trading_bot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class NotificationManager:
+    def __init__(self, telegram_token: str = None, telegram_chat_id: str = None,
+                 twilio_sid: str = None, twilio_token: str = None, twilio_number: str = None):
+        self.telegram_enabled = bool(telegram_token and telegram_chat_id)
+        self.sms_enabled = bool(twilio_sid and twilio_token and twilio_number)
+        
+        if self.telegram_enabled:
+            self.telegram_bot = telebot.TeleBot(telegram_token)
+            self.telegram_chat_id = telegram_chat_id
+        
+        if self.sms_enabled:
+            self.twilio_client = TwilioClient(twilio_sid, twilio_token)
+            self.twilio_number = twilio_number
+    
+    def send_notification(self, message: str, notification_type: str = "all") -> bool:
+        """Send notification via Telegram and/or SMS"""
+        success = True
+        
+        try:
+            if notification_type in ("all", "telegram") and self.telegram_enabled:
+                self.telegram_bot.send_message(self.telegram_chat_id, message)
+                logger.info("Telegram notification sent")
+            
+            if notification_type in ("all", "sms") and self.sms_enabled:
+                self.twilio_client.messages.create(
+                    body=message,
+                    from_=self.twilio_number,
+                    to=self.telegram_chat_id  # Using chat ID as phone number for demo
+                )
+                logger.info("SMS notification sent")
+        
+        except Exception as e:
+            logger.error(f"Failed to send notification: {e}")
+            success = False
+        
+        return success
+
+class TradingBot:
+    def __init__(self, api_key: str, api_secret: str, notification_manager: NotificationManager,
+                 symbol: str = 'BTCUSDT', timeframe: str = '1h'):
+        self.client = Client(api_key, api_secret)
+        self.notifier = notification_manager
+        self.symbol = symbol
+        self.timeframe = timeframe
+        self.trade_percentage = 0.1  # 10% of equity
+        self.stop_loss_pct = 0.01    # 1%
+        self.take_profit_pct = 0.03  # 3%
+        self.min_order_size = self.get_min_order_size()
+        self.position = None  # Tracks current position
+        
+        # Test connection and notify
+        try:
+            self.client.get_account()
+            msg = f"✅ Binance Trading Bot Started\nSymbol: {symbol}\nTimeframe: {timeframe}"
+            self.notifier.send_notification(msg)
+            logger.info("Successfully connected to Binance API")
+        except Exception as e:
+            error_msg = f"❌ Failed to connect to Binance API: {str(e)}"
+            self.notifier.send_notification(error_msg, "all")
+            logger.error(error_msg)
+            raise
+
+    # ... (keep all previous methods from the previous version unchanged until run_strategy)
+
+    def run_strategy(self) -> None:
+        """Execute the trading strategy with notifications"""
+        try:
+            data = self.get_historical_data()
+            current_close = data['close'].iloc[-1]
+            
+            ema25, ema50, rsi, adx = self.calculate_indicators(data)
+            
+            # Format market data for notifications
+            market_status = (
+                f"📊 {self.symbol} Market Update:\n"
+                f"Price: ${current_close:.2f}\n"
+                f"EMA25: {ema25:.2f} | EMA50: {ema50:.2f}\n"
+                f"RSI: {rsi:.2f} | ADX: {adx:.2f}"
+            )
+            logger.info(market_status)
+            
+            self.check_position_status()
+            
+            # Buy condition
+            if not self.position and current_close > ema25 and current_close > ema50 and rsi > 50 and adx > 20:
+                usdt_balance = self.get_account_balance()
+                quantity = (usdt_balance * self.trade_percentage) / current_close
+                quantity = round(quantity, 6)
+                
+                if quantity >= self.min_order_size:
+                    order = self.place_order('BUY', quantity)
+                    if order:
+                        entry_price = float(order['fills'][0]['price'])
+                        msg = (
+                            f"🚀 BUY ORDER EXECUTED\n"
+                            f"Symbol: {self.symbol}\n"
+                            f"Quantity: {quantity:.6f}\n"
+                            f"Entry Price: ${entry_price:.2f}\n"
+                            f"SL: {self.stop_loss_pct*100}% | TP: {self.take_profit_pct*100}%"
+                        )
+                        self.notifier.send_notification(msg, "all")
+                else:
+                    warning_msg = f"⚠️ Insufficient funds for minimum order size ({self.min_order_size})"
+                    self.notifier.send_notification(warning_msg)
+            
+            # Sell condition
+            elif self.position and current_close < ema25 and current_close < ema50:
+                order = self.place_order('SELL', self.position['quantity'])
+                if order:
+                    exit_price = float(order['fills'][0]['price'])
+                    pnl_pct = ((exit_price - self.position['entry_price']) / self.position['entry_price']) * 100
+                    msg = (
+                        f"📉 SELL ORDER EXECUTED\n"
+                        f"Symbol: {self.symbol}\n"
+                        f"Quantity: {self.position['quantity']:.6f}\n"
+                        f"Exit Price: ${exit_price:.2f}\n"
+                        f"PnL: {pnl_pct:.2f}%"
+                    )
+                    self.notifier.send_notification(msg, "all")
+        
+        except Exception as e:
+            error_msg = f"🔴 Strategy Error: {str(e)}"
+            self.notifier.send_notification(error_msg, "all")
+            logger.error(error_msg)
+
+    # ... (keep the rest of the methods the same)
+
+if __name__ == "__main__":
+    # Initialize notification manager
+    notifier = NotificationManager(
+        telegram_token="YOUR_TELEGRAM_BOT_TOKEN",
+        telegram_chat_id="YOUR_TELEGRAM_CHAT_ID",
+        twilio_sid="YOUR_TWILIO_SID",
+        twilio_token="YOUR_TWILIO_AUTH_TOKEN",
+        twilio_number="YOUR_TWILIO_PHONE_NUMBER"
+    )
+    
+    # Initialize trading bot
+    bot = TradingBot(
+        api_key="YOUR_BINANCE_API_KEY",
+        api_secret="YOUR_BINANCE_API_SECRET",
+        notification_manager=notifier,
+        symbol="BTCUSDT",
+        timeframe="1h"
+    )
+    
+    bot.run()
